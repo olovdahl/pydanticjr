@@ -1,0 +1,146 @@
+import json
+from typing import Any, Dict, Type, get_type_hints, get_origin, get_args
+from datetime import datetime
+from enum import Enum
+
+class ValidationError(Exception):
+    """Custom exception for validation errors"""
+    pass
+
+class BaseModel:
+    """Base class for JSON serializable models"""
+    
+    def __init__(self, **kwargs):
+        # Get type hints for this class
+        type_hints = get_type_hints(self.__class__)
+        
+        # Validate and set attributes
+        for field_name, field_type in type_hints.items():
+            if field_name in kwargs:
+                value = kwargs[field_name]
+                # Validate the type
+                validated_value = self._validate_field(field_name, value, field_type)
+                setattr(self, field_name, validated_value)
+            else:
+                # Check if field has a default value
+                if hasattr(self.__class__, field_name):
+                    default_value = getattr(self.__class__, field_name)
+                    setattr(self, field_name, default_value)
+                else:
+                    raise ValidationError(f"Missing required field: {field_name}")
+    
+    def _validate_field(self, field_name: str, value: Any, field_type: Type) -> Any:
+        """Validate a field value against its type"""
+        
+        # Handle None values
+        if value is None:
+            origin = get_origin(field_type)
+            if origin is not None:
+                args = get_args(field_type)
+                if len(args) == 2 and type(None) in args:
+                    # This is Optional[T] or Union[T, None]
+                    return None
+            raise ValidationError(f"Field '{field_name}' cannot be None")
+        
+        # Get the origin type (for generics like List, Dict, etc.)
+        origin = get_origin(field_type)
+        
+        if origin is None:
+            # Simple type validation
+            if field_type == Any:
+                return value
+            elif isinstance(field_type, type) and issubclass(field_type, BaseModel):
+                # Nested model
+                if isinstance(value, dict):
+                    return field_type(**value)
+                elif isinstance(value, field_type):
+                    return value
+                else:
+                    raise ValidationError(f"Field '{field_name}' must be a dict or {field_type.__name__}")
+            elif not isinstance(value, field_type):
+                # Try to convert common types
+                try:
+                    if field_type == int and isinstance(value, str):
+                        return int(value)
+                    elif field_type == float and isinstance(value, (str, int)):
+                        return float(value)
+                    elif field_type == str:
+                        return str(value)
+                    elif field_type == bool and isinstance(value, str):
+                        return value.lower() in ('true', '1', 'yes', 'on')
+                    else:
+                        raise ValidationError(f"Field '{field_name}' must be of type {field_type.__name__}")
+                except (ValueError, TypeError):
+                    raise ValidationError(f"Cannot convert '{value}' to {field_type.__name__} for field '{field_name}'")
+        
+        elif origin is list:
+            # List validation
+            if not isinstance(value, list):
+                raise ValidationError(f"Field '{field_name}' must be a list")
+            
+            args = get_args(field_type)
+            if args:
+                item_type = args[0]
+                return [self._validate_field(f"{field_name}[{i}]", item, item_type) 
+                       for i, item in enumerate(value)]
+        
+        elif origin is dict:
+            # Dict validation
+            if not isinstance(value, dict):
+                raise ValidationError(f"Field '{field_name}' must be a dict")
+            
+            args = get_args(field_type)
+            if len(args) == 2:
+                key_type, value_type = args
+                return {
+                    self._validate_field(f"{field_name}_key", k, key_type): 
+                    self._validate_field(f"{field_name}[{k}]", v, value_type)
+                    for k, v in value.items()
+                }
+        
+        return value
+    
+    def dict(self) -> Dict[str, Any]:
+        """Convert model to dictionary"""
+        result = {}
+        for attr_name in dir(self):
+            if not attr_name.startswith('_') and not callable(getattr(self, attr_name)):
+                value = getattr(self, attr_name)
+                if isinstance(value, BaseModel):
+                    result[attr_name] = value.dict()
+                elif isinstance(value, list):
+                    result[attr_name] = [
+                        item.dict() if isinstance(item, BaseModel) else item 
+                        for item in value
+                    ]
+                elif isinstance(value, dict):
+                    result[attr_name] = {
+                        k: v.dict() if isinstance(v, BaseModel) else v 
+                        for k, v in value.items()
+                    }
+                else:
+                    result[attr_name] = value
+        return result
+    
+    def json(self, indent: int = None) -> str:
+        """Convert model to JSON string"""
+        return json.dumps(self.dict(), indent=indent, default=str)
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'BaseModel':
+        """Create model instance from dictionary"""
+        return cls(**data)
+    
+    @classmethod
+    def from_json(cls, json_str: str) -> 'BaseModel':
+        """Create model instance from JSON string"""
+        data = json.loads(json_str)
+        return cls.from_dict(data)
+    
+    def __repr__(self) -> str:
+        attrs = []
+        for attr_name in dir(self):
+            if not attr_name.startswith('_') and not callable(getattr(self, attr_name)):
+                value = getattr(self, attr_name)
+                attrs.append(f"{attr_name}={repr(value)}")
+        return f"{self.__class__.__name__}({', '.join(attrs)})"
