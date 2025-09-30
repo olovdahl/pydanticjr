@@ -1,0 +1,251 @@
+import json
+from typing import (
+    Any,
+    Dict,
+    Type,
+    get_type_hints,
+    get_origin,
+    get_args,
+    Union,
+)
+from datetime import datetime
+from enum import Enum
+
+
+class ValidationError(Exception):
+    """Custom exception for validation errors"""
+
+    pass
+
+
+class BaseModel:
+    """Base class for JSON serializable models"""
+
+    def __init__(self, **kwargs):
+        # Get type hints for this class
+        type_hints = get_type_hints(self.__class__)
+
+        # Track which fields were set
+        self.__fields_set__ = set()
+
+        # Validate and set attributes
+        for field_name, field_type in type_hints.items():
+            if field_name in kwargs:
+                value = kwargs[field_name]
+                validated_value = self._validate_field(
+                    field_name, value, field_type
+                )
+                setattr(self, field_name, validated_value)
+                self.__fields_set__.add(field_name)
+            else:
+                # Check for default value from class attribute
+                default_value = getattr(self.__class__, field_name, ...)
+                if default_value is not ...:
+                    # Use copy for mutable defaults to avoid shared state
+                    if isinstance(default_value, (list, dict, set)):
+                        import copy
+
+                        setattr(self, field_name, copy.deepcopy(default_value))
+                    else:
+                        setattr(self, field_name, default_value)
+                else:
+                    raise ValidationError(
+                        f"Missing required field: {field_name}"
+                    )
+
+        # Check for extra fields (optional strict mode)
+        extra_fields = set(kwargs.keys()) - set(type_hints.keys())
+        if extra_fields and getattr(self, "__strict__", False):
+            raise ValidationError(
+                f"Extra fields not allowed: {', '.join(extra_fields)}"
+            )
+
+    def _validate_field(
+        self, field_name: str, value: Any, field_type: Type
+    ) -> Any:
+        """Validate a field value against its type"""
+
+        # Get the origin type (for generics like List, Dict, etc.)
+        origin = get_origin(field_type)
+        args = get_args(field_type)
+
+        # Handle Union types (including Optional)
+        if origin is Union:
+            # Try each type in the union
+            errors = []
+            for union_type in args:
+                if union_type is type(None) and value is None:
+                    return None
+                try:
+                    return self._validate_field(
+                        field_name, value, union_type
+                    )
+                except ValidationError as e:
+                    errors.append(str(e))
+            raise ValidationError(
+                f"Field '{field_name}' does not match any type in Union: "
+                f"{errors}"
+            )
+
+        # Handle None values
+        if value is None:
+            raise ValidationError(f"Field '{field_name}' cannot be None")
+
+        # Handle Any type
+        if field_type is Any:
+            return value
+
+        # Handle list types
+        if origin is list:
+            if not isinstance(value, list):
+                raise ValidationError(f"Field '{field_name}' must be a list")
+            if args:
+                item_type = args[0]
+                return [
+                    self._validate_field(f"{field_name}[{i}]", item, item_type)
+                    for i, item in enumerate(value)
+                ]
+            return value
+
+        # Handle dict types
+        if origin is dict:
+            if not isinstance(value, dict):
+                raise ValidationError(f"Field '{field_name}' must be a dict")
+            if len(args) == 2:
+                key_type, value_type = args
+                return {
+                    self._validate_field(f"{field_name}_key", k, key_type): 
+                    self._validate_field(f"{field_name}[{k}]", v, value_type)
+                    for k, v in value.items()
+                }
+            return value
+
+        # Handle BaseModel subclasses (nested models)
+        if isinstance(field_type, type) and issubclass(field_type, BaseModel):
+            if isinstance(value, dict):
+                return field_type(**value)
+            elif isinstance(value, field_type):
+                return value
+            else:
+                raise ValidationError(
+                    f"Field '{field_name}' must be a dict or "
+                    f"{field_type.__name__}"
+                )
+
+        # Handle Enum types
+        if isinstance(field_type, type) and issubclass(field_type, Enum):
+            if isinstance(value, field_type):
+                return value
+            try:
+                return field_type(value)
+            except (ValueError, KeyError):
+                valid_values = [e.value for e in field_type]
+                raise ValidationError(
+                    f"Field '{field_name}' must be one of {valid_values}"
+                )
+
+        # Handle datetime
+        if field_type is datetime:
+            if isinstance(value, datetime):
+                return value
+            if isinstance(value, str):
+                try:
+                    return datetime.fromisoformat(
+                        value.replace("Z", "+00:00")
+                    )
+                except ValueError as e:
+                    raise ValidationError(
+                        f"Field '{field_name}': Invalid datetime format: {e}"
+                    )
+            raise ValidationError(
+                f"Field '{field_name}' must be a datetime or ISO string"
+            )
+
+        # Handle primitive types with conversion
+        if not isinstance(value, field_type):
+            try:
+                if field_type == int and isinstance(value, (str, float)):
+                    return int(value)
+                elif field_type == float and isinstance(value, (str, int)):
+                    return float(value)
+                elif field_type == str:
+                    return str(value)
+                elif field_type == bool:
+                    if isinstance(value, str):
+                        return value.lower() in ("true", "1", "yes", "on")
+                    return bool(value)
+                else:
+                    raise ValidationError(
+                        f"Field '{field_name}' must be of type "
+                        f"{field_type.__name__}"
+                    )
+            except (ValueError, TypeError) as e:
+                raise ValidationError(
+                    f"Cannot convert '{value}' to {field_type.__name__} "
+                    f"for field '{field_name}': {e}"
+                )
+
+        return value
+
+    def dict(self, exclude_unset: bool = False) -> Dict[str, Any]:
+        """Convert model to dictionary"""
+        type_hints = get_type_hints(self.__class__)
+        result = {}
+
+        for field_name in type_hints:
+            if exclude_unset and field_name not in self.__fields_set__:
+                continue
+
+            if not hasattr(self, field_name):
+                continue
+
+            value = getattr(self, field_name)
+            result[field_name] = self._serialize_value(value)
+
+        return result
+
+    def _serialize_value(self, value: Any) -> Any:
+        """Helper to serialize a value"""
+        if isinstance(value, BaseModel):
+            return value.dict()
+        elif isinstance(value, list):
+            return [self._serialize_value(item) for item in value]
+        elif isinstance(value, dict):
+            return {k: self._serialize_value(v) for k, v in value.items()}
+        elif isinstance(value, Enum):
+            return value.value
+        elif isinstance(value, datetime):
+            return value.isoformat()
+        else:
+            return value
+
+    def json(self, indent: int = None, exclude_unset: bool = False) -> str:
+        """Convert model to JSON string"""
+        return json.dumps(
+            self.dict(exclude_unset=exclude_unset), indent=indent
+        )
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "BaseModel":
+        """Create model instance from dictionary"""
+        return cls(**data)
+
+    @classmethod
+    def from_json(cls, json_str: str) -> "BaseModel":
+        """Create model instance from JSON string"""
+        data = json.loads(json_str)
+        return cls.from_dict(data)
+
+    def __repr__(self) -> str:
+        type_hints = get_type_hints(self.__class__)
+        attrs = []
+        for field_name in type_hints:
+            if hasattr(self, field_name):
+                value = getattr(self, field_name)
+                attrs.append(f"{field_name}={repr(value)}")
+        return f"{self.__class__.__name__}({', '.join(attrs)})"
+
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, self.__class__):
+            return False
+        return self.dict() == other.dict()
